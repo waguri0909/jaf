@@ -526,6 +526,55 @@ def ensure_guild_stock(guild_id):
         print(f"재고 이전 오류: {e}")
     return base
 
+def load_eternal(guild_id=None):
+    d = load_guild_json(guild_id, 'eternal', {})
+    if isinstance(d, dict):
+        return d
+    if isinstance(d, list):  # 구 형식 호환
+        return {str(x): True for x in d}
+    return {}
+
+def is_eternal_product(guild_id, product_name):
+    try:
+        return bool(load_eternal(guild_id).get(str(product_name), False))
+    except Exception:
+        return False
+
+def set_eternal_product(guild_id, product_name, on):
+    d = load_eternal(guild_id)
+    if on:
+        d[str(product_name)] = True
+    else:
+        d.pop(str(product_name), None)
+    save_guild_json(guild_id, 'eternal', d)
+
+def get_eternal_line(guild_id, product_name):
+    # 영구 재고로 계속 나갈 한 줄 (첫 번째 줄)
+    base = guild_stock_dir(guild_id)
+    if not os.path.isdir(base):
+        return None
+    for category in get_categories_from_stock_folder(guild_id):
+        cp = os.path.join(base, category)
+        if not os.path.isdir(cp):
+            continue
+        try:
+            for fn in sorted(os.listdir(cp)):
+                if not fn.endswith('.txt'):
+                    continue
+                parsed = parse_filename(fn)
+                if not parsed or parsed.get('product_name') != product_name:
+                    continue
+                try:
+                    with open(os.path.join(cp, fn), 'r', encoding='utf-8') as f:
+                        for line in f:
+                            if line.strip():
+                                return line.strip()
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return None
+
 def remove_product_stock(guild_id, product_name, quantity):
     quantity = validate_positive_int(quantity, MAX_QUANTITY)
     validate_string_length(product_name, 100)
@@ -1462,7 +1511,14 @@ class ProductBuyView(nextcord.ui.View):
             return
         
         current_stock = get_product_stock_count(self.guildid, product_name)
-        if current_stock < quantity:
+        eternal = is_eternal_product(self.guildid, product_name)
+        pinned = get_eternal_line(self.guildid, product_name) if eternal else None
+        if eternal and not pinned:
+            embed = nextcord.Embed(title="⛔ㆍ재고 없음", color=0xff0000)
+            embed.add_field(name="", value="영구 상품의 재고 한 줄을 먼저 등록해주세요.", inline=False)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        if not eternal and current_stock < quantity:
             embed = nextcord.Embed(title="⛔ㆍ재고 부족", color=0xff0000)
             embed.add_field(name="", value=f"재고가 부족해요.\n현재 재고: {current_stock}개, 요청 수량: {quantity}개", inline=False)
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1493,7 +1549,10 @@ class ProductBuyView(nextcord.ui.View):
             
             update_user_data(self.guildid, interaction.user.id, user_data)
             
-            purchased_items = remove_product_stock(self.guildid, product_name, quantity)
+            if eternal:
+                purchased_items = [pinned] * quantity
+            else:
+                purchased_items = remove_product_stock(self.guildid, product_name, quantity)
             add_purchase_log(self.guildid, interaction.user.id, product_name, quantity, total_price, discount_amount, purchased_items=purchased_items)
             if purchased_items:
                 items_content = "\n".join(purchased_items)
@@ -1930,11 +1989,11 @@ class CategorySelect(nextcord.ui.Select):
             return
         if self.is_purchase:
             purchase_view = ProductSelectView(interaction.guild.id, category)
-            embed = ProductListPaginationView.create_embed(products, category, embed_title, 0)
+            embed = ProductListPaginationView.create_embed(products, category, embed_title, 0, interaction.guild.id if interaction.guild else None)
             view = ProductListPaginationView(products, category, embed_title, 0, purchase_view, interaction.guild.id)
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
         else:
-            embed = ProductListPaginationView.create_embed(products, category, embed_title, 0)
+            embed = ProductListPaginationView.create_embed(products, category, embed_title, 0, interaction.guild.id if interaction.guild else None)
             view = ProductListPaginationView(products, category, embed_title, 0, None, interaction.guild.id)
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 class ProductListPaginationView(nextcord.ui.View):
@@ -1965,7 +2024,7 @@ class ProductListPaginationView(nextcord.ui.View):
         self.add_item(next_btn)
     
     @staticmethod
-    def create_embed(products, category, embed_title, page=0):
+    def create_embed(products, category, embed_title, page=0, guild_id=None):
         embed = nextcord.Embed(title=embed_title, color=0xfffffe)
         
         if not products:
@@ -1996,7 +2055,10 @@ class ProductListPaginationView(nextcord.ui.View):
                         break
             
             field_name = f"{product_emoji} {product_name}" if product_emoji else product_name
-            field_value = f"{product_data['price']:,}원\n재고 {product_data['stock']:,}개"
+            if guild_id is not None and is_eternal_product(guild_id, product_name):
+                field_value = f"{product_data['price']:,}원\n재고 ♾️ 영구"
+            else:
+                field_value = f"{product_data['price']:,}원\n재고 {product_data['stock']:,}개"
             embed.add_field(name=field_name, value=field_value, inline=False)
         
         if total_pages > 1:
@@ -2024,7 +2086,7 @@ class ProductListPaginationView(nextcord.ui.View):
         await interaction.response.defer()
         if self.current_page > 0:
             self.current_page -= 1
-            embed = self.create_embed(self.products, self.category, self.embed_title, self.current_page)
+            embed = self.create_embed(self.products, self.category, self.embed_title, self.current_page, self.guild_id)
             view = ProductListPaginationView(self.products, self.category, self.embed_title, self.current_page, self.purchase_view, self.guild_id)
             await interaction.edit_original_message(embed=embed, view=view)
     
@@ -2067,7 +2129,10 @@ class ProductSelectSelect(nextcord.ui.Select):
                 product_emoji = get_product_emoji(category, product_name)
             
             label = f"{product_emoji} {product_data['name']}" if product_emoji else product_data['name']
-            description = f"{product_data['price']:,}원 | 재고 {product_data['stock']:,}개"
+            if is_eternal_product(guilid, product_name):
+                description = f"{product_data['price']:,}원 | ♾️ 영구"
+            else:
+                description = f"{product_data['price']:,}원 | 재고 {product_data['stock']:,}개"
             value = product_name
             options.append(nextcord.SelectOption(label=label, description=description, value=value))
         if not options:
@@ -2088,7 +2153,7 @@ class ProductSelectSelect(nextcord.ui.Select):
         if product_data['stock'] == 0:
             await interaction.response.send_message("재고가 부족해요.", ephemeral=True)
             return
-        await interaction.response.send_modal(PurChaseInfo(product_data['name'], product_data['stock']))
+        await interaction.response.send_modal(PurChaseInfo(product_data['name'], product_data['stock'], is_eternal_product(interaction.guild.id if interaction.guild else None, product_data['name'])))
 class BankTransferModal(nextcord.ui.Modal):
     def __init__(self):
         super().__init__(
@@ -2439,13 +2504,16 @@ class MultiApprovalModal(nextcord.ui.Modal):
             await interaction.response.send_message(f"금액수정 승인 처리 중 오류가 발생했습니다: {e}", ephemeral=True)
 
 class PurChaseInfo(nextcord.ui.Modal):
-    def __init__(self, product_title, invent):
+    def __init__(self, product_title, invent, eternal=False):
         super().__init__(
             title=f"{product_title}ㆍ제품 구매",
             custom_id="purchase",
             timeout=None
         )
-        placeholder_text = f"현재 재고: {invent}개 (최대 {invent}개까지 구매 가능)" if invent > 0 else "재고가 없습니다."
+        if eternal:
+            placeholder_text = "♾️ 영구 상품 (원하는 수량 입력)"
+        else:
+            placeholder_text = f"현재 재고: {invent}개 (최대 {invent}개까지 구매 가능)" if invent > 0 else "재고가 없습니다."
         self.field = nextcord.ui.TextInput(
             label="구매할 수량을 입력해주세요.",
             placeholder=placeholder_text,
@@ -2482,7 +2550,7 @@ class PurChaseInfo(nextcord.ui.Modal):
             return
 
         current_stock = get_product_stock_count(interaction.guild.id, self.product_title)
-        if current_stock < amount:
+        if not is_eternal_product(interaction.guild.id, self.product_title) and current_stock < amount:
             await _send("⛔ㆍ재고가 부족해요.")
             return
 

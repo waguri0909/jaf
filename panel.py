@@ -16,8 +16,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STOCK_DIR = os.path.join(BASE_DIR, "stock")
 DATA_DIR = os.path.join(BASE_DIR, "data")
-HOST = "127.0.0.1"
-PORT = 8099
+HOST = os.getenv("PANEL_HOST", "0.0.0.0" if os.getenv("PORT") else "127.0.0.1")
+try:
+    PORT = int(os.getenv("PORT", os.getenv("PANEL_PORT", "8099")))
+except ValueError:
+    PORT = 8099
 MAX_PRICE = 2 ** 31 - 1
 MAX_BALANCE = 2 ** 31 - 1
 
@@ -81,10 +84,29 @@ def load_bot_guilds():
                 with open(fp, "r", encoding="utf-8") as f:
                     d = json.load(f)
                     if isinstance(d, dict) and isinstance(d.get("guilds"), list):
-                        return d["guilds"]
+                        out = [g for g in d["guilds"] if isinstance(g, dict) and g.get("id")]
+                        if out:
+                            return out
             except Exception:
                 pass
-    return []
+    # 폴백: 봇 파일이 없으면 stock/·data/guilds/ 폴더명(서버ID)으로 복원
+    found = set()
+    try:
+        if os.path.isdir(STOCK_DIR):
+            for item in os.listdir(STOCK_DIR):
+                if item.isdigit():
+                    found.add(item)
+    except OSError:
+        pass
+    try:
+        gd = os.path.join(DATA_DIR, "guilds")
+        if os.path.isdir(gd):
+            for item in os.listdir(gd):
+                if item.isdigit():
+                    found.add(item)
+    except OSError:
+        pass
+    return [{"id": gid, "name": gid} for gid in sorted(found)]
 
 
 def get_categories(guild_id=None):
@@ -113,8 +135,38 @@ def find_product_files(category, product_name, guild_id=None):
     return found
 
 
+def load_eternal(guild_id):
+    fp = guild_data_file(guild_id, "eternal")
+    if not os.path.exists(fp):
+        return {}
+    try:
+        with open(fp, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            if isinstance(d, dict):
+                return d
+            if isinstance(d, list):
+                return {str(x): True for x in d}
+    except Exception:
+        pass
+    return {}
+
+
+def save_eternal(guild_id, data):
+    if guild_id:
+        try:
+            fp = os.path.join(DATA_DIR, "guilds", str(int(guild_id)), "eternal.json")
+            os.makedirs(os.path.dirname(fp), exist_ok=True)
+        except (ValueError, TypeError):
+            fp = os.path.join(DATA_DIR, "eternal.json")
+    else:
+        fp = os.path.join(DATA_DIR, "eternal.json")
+    with open(fp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 def get_products(guild_id=None):
     result = []
+    eternal = load_eternal(guild_id)
     for cat in get_categories(guild_id):
         cat_path = os.path.join(guild_stock_base(guild_id), cat)
         try:
@@ -142,7 +194,8 @@ def get_products(guild_id=None):
                 exist["files"].append(fn)
             else:
                 result.append({"category": cat, "name": name, "price": price,
-                               "stock": stock, "files": [fn]})
+                               "stock": stock, "files": [fn],
+                               "eternal": bool(eternal.get(name, False))})
     result.sort(key=lambda x: (x["category"], x["price"]))
     return result
 
@@ -478,13 +531,15 @@ pc.innerHTML='';sc.innerHTML='';sp.innerHTML='';dc.innerHTML='';
 let cats=(d.categories&&d.categories.length)?d.categories:[...new Set(d.products.map(p=>p.category))];
 cats.forEach(c=>{pc.innerHTML+=`<option>${c}</option>`;sc.innerHTML+=`<option>${c}</option>`;dc.innerHTML+=`<option>${c}</option>`});
 d.products.forEach(p=>{sp.innerHTML+=`<option data-c="${p.category}">${p.name}</option>`;
-tb.innerHTML+=`<tr><td>${p.category}</td><td>${p.name}</td><td>${p.price.toLocaleString()}</td><td>${p.stock}</td>
+tb.innerHTML+=`<tr><td>${p.category}</td><td>${p.name}</td><td>${p.price.toLocaleString()}</td><td>${p.eternal?'♾️ 영구':p.stock}</td>
 <td><button class="act" onclick="chPrice('${p.category}','${p.name}')">가격변경</button>
+<button class="act" onclick="toggleEternal('${p.category}','${p.name}',${p.eternal?0:1})">${p.eternal?'영구해제':'영구'}</button>
 <button class="danger" onclick="delProd('${p.category}','${p.name}')">삭제</button></td></tr>`});}
 async function mkCat(){let v=document.getElementById('nc').value;let d=await api('/api/category/create','POST',{category:v});alert(d.ok?'완료':d.error);loadProd()}
 async function delCat(){let c=document.getElementById('dc').value;if(!c){alert('삭제할 카테고리 선택');return}if(!confirm(`[${c}] 카테고리 + 상품 전체 삭제?`))return;let d=await api('/api/category/delete','POST',{category:c});alert(d.ok?'삭제됨':d.error);loadProd()}
 async function mkProd(){let d=await api('/api/product/create','POST',{category:document.getElementById('pc').value,name:document.getElementById('pn').value,price:+document.getElementById('pp').value});alert(d.ok?'완료':d.error);loadProd()}
 async function chPrice(c,n){let v=prompt('새 가격');if(!v)return;let d=await api('/api/product/price','POST',{category:c,name:n,new_price:+v});alert(d.ok?'완료':d.error);loadProd()}
+async function toggleEternal(c,n,en){let d=await api('/api/product/eternal','POST',{category:c,name:n,enable:!!en});alert(d.ok?(en?'영구 설정됨 (재고 1줄이 계속 나감)':'영구 해제됨'):d.error);loadProd()}
 async function delProd(c,n){if(!confirm('삭제?'))return;let d=await api('/api/product/delete','POST',{category:c,name:n});alert(d.ok?'완료':d.error);loadProd()}
 async function viewStock(){let c=document.getElementById('sc').value;let s=document.getElementById('sp');let n=s.options[s.selectedIndex]?.text;if(!n)return;
 let d=await api('/api/stock?category='+encodeURIComponent(c)+'&name='+encodeURIComponent(n));if(!d.ok){alert(d.error);return}
@@ -875,6 +930,23 @@ class Handler(BaseHTTPRequestHandler):
                 for l in all_lines:
                     f.write(l + "\n")
             return self.send_json({"ok": True})
+        if path == "/api/product/eternal":
+            name = (b.get("name") or "").strip()
+            gid = b.get("guild") or None
+            if not guild_allowed(self, gid):
+                return self.send_json({"ok": False, "error": guild_deny(self)}, 403)
+            if not name:
+                return self.send_json({"ok": False, "error": "상품명 오류"}, 400)
+            try:
+                data = load_eternal(gid)
+                if b.get("enable"):
+                    data[name] = True
+                else:
+                    data.pop(name, None)
+                save_eternal(gid, data)
+            except OSError as e:
+                return self.send_json({"ok": False, "error": str(e)}, 500)
+            return self.send_json({"ok": True})
         if path == "/api/product/delete":
             cat = safe_name(b.get("category"))
             name = (b.get("name") or "").strip()
@@ -946,7 +1018,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/user/balance":
             users = load_users()
             uid = str(b.get("user_id") or "").strip()
-            ugid = uid.split(":")[0] if ":" in uid else None
+            # 구 형식 키(콜론 없음)는 선택된 서버 기준으로 확인
+            ugid = uid.split(":")[0] if ":" in uid else (b.get("guild") or None)
             if not guild_allowed(self, ugid):
                 return self.send_json({"ok": False, "error": guild_deny(self)}, 403)
             mode = b.get("mode") or "add"
@@ -978,5 +1051,5 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     os.makedirs(STOCK_DIR, exist_ok=True)
     os.makedirs(DATA_DIR, exist_ok=True)
-    print(f"패널 실행: http://{HOST}:{PORT} (로컬 전용, Ctrl+C 종료)")
+    print(f"패널 실행: http://{HOST}:{PORT} (Ctrl+C 종료)")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
